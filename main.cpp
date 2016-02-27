@@ -1,10 +1,13 @@
 #define GLFW_DLL
+
 #include "camera.hpp"
 #include "vectors.hpp"
 #include "scene.hpp"
 #include "grid.hpp"
+
 #include <GLFW/glfw3.h>
-#include <CL/cl.h>
+#include <CL/cl.hpp>
+
 #include <fstream>
 #include <string>
 #include <iostream>
@@ -28,51 +31,74 @@ std::vector<CellData> cells;
 int* random_array;
 unsigned long int sample_count = 0;
 
-const size_t cell_resolution = 64;
+const size_t cell_resolution = 16;
 const size_t cell_resolution3 = cell_resolution * cell_resolution * cell_resolution;
 
-void InitCL()
+#define PRINT_SIZE(x)   std::cout << "sizeof(" << #x << "): " << sizeof(x) << std::endl
+
+bool InitCL()
 {
-	cl_platform_id platform_id;
-	clGetPlatformIDs(1, &platform_id, 0);
-	
-	cl_device_id device_id;
-	clGetDeviceIDs( platform_id, CL_DEVICE_TYPE_GPU, 1, &device_id, 0);
-	cl_context context = clCreateContext(0, 1, &device_id, 0, 0, 0);
-	queue = clCreateCommandQueue(context, device_id, 0, 0);
-	
-	std::ifstream input_file("kernel.cl");
-	if (!input_file)
-	{
-		std::cerr << "Cannot load kernel file" << std::endl;
-		return;
-	}
-	
-	std::string curr_line, source;
-    source += "#define GRID_RES " + static_cast<std::ostringstream*>( &(std::ostringstream() << cell_resolution) )->str();
-    source += "\n";
-	while (std::getline(input_file, curr_line))
-	{
-		source += curr_line + "\n";
-	}
+    //get all platforms (drivers)
+    std::vector<cl::Platform> all_platforms;
+    cl::Platform::get(&all_platforms);
+    if (all_platforms.size() == 0)
+    {
+        std::cerr << " No platforms found. Check OpenCL installation!" << std::endl;
+        return false;
+    }
+    cl::Platform default_platform = all_platforms[0];
+    std::cout << "Using platform: " << default_platform.getInfo<CL_PLATFORM_NAME>() << std::endl;
 
-	const char *str = source.c_str();
-	cl_program program = clCreateProgramWithSource(context, 1, &str, 0, 0);
-	cl_int result = clBuildProgram(program, 1, &device_id, 0, 0, 0);
-	
-    size_t len;
-    clGetProgramBuildInfo(program, device_id, CL_PROGRAM_BUILD_LOG, 0, 0, &len);
-    char *log = new char[len];
-    clGetProgramBuildInfo(program, device_id, CL_PROGRAM_BUILD_LOG, len, log, 0);
-    std::cout << log << std::endl;
-    delete[] log;
+    //get default device of the default platform
+    std::vector<cl::Device> all_devices;
+    default_platform.getDevices(CL_DEVICE_TYPE_ALL, &all_devices);
+    if (all_devices.size() == 0)
+    {
+        std::cerr << " No devices found. Check OpenCL installation!" << std::endl;
+        return false;
+    }
+    cl::Device default_device = all_devices[0];
+    std::cout << "Using device: " << default_device.getInfo<CL_DEVICE_NAME>() << std::endl;
 
-	if (result)
-	{
-		std::cerr << "Error during compilation! (" << result << ")" << std::endl;
-	}
+    cl::Context context({default_device});
 
-	kernel = clCreateKernel(program, "main", 0);
+    std::ifstream input_file("kernel.cl");
+    if (!input_file)
+    {
+        std::cerr << "Cannot load kernel file" << std::endl;
+        return false;
+    }
+
+    PRINT_SIZE(int);
+    PRINT_SIZE(cl_int);
+    PRINT_SIZE(cl_float4);
+    PRINT_SIZE(float3);
+    PRINT_SIZE(Triangle);
+    PRINT_SIZE(CellData);
+
+    cl::Program::Sources sources;
+
+    std::ostringstream buf;
+    buf << "#define GRID_RES " << cell_resolution << std::endl;
+    sources.push_back({buf.str().c_str(), buf.str().length()});
+
+    std::string curr_line;
+    while (std::getline(input_file, curr_line))
+    {
+        curr_line += "\n";
+        sources.push_back({curr_line.c_str(), curr_line.length()});
+    }
+
+    cl::Program program(context, sources);
+    if (program.build({default_device}) != CL_SUCCESS)
+    {
+        std::cerr << " Error building: " << program.getBuildInfo<CL_PROGRAM_BUILD_LOG>(default_device) << std::endl;
+        return false;
+    }
+
+    std::cout << program.getBuildInfo<CL_PROGRAM_BUILD_LOG>(default_device) << std::endl;
+
+	kernel = clCreateKernel(program(), "main", 0);
 
     random_array = new int[global_work_size];
 
@@ -81,12 +107,12 @@ void InitCL()
         random_array[i] = rand();
     }
 
-	pixel_buffer  = clCreateBuffer(context, CL_MEM_READ_WRITE, g_Width*g_Height*sizeof(cl_float4), 0, 0);
-	random_buffer = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, g_Width*g_Height*sizeof(cl_int), random_array, 0);
-    scene_buffer  = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof(Triangle) * triangles.size(), triangles.begin()._Ptr, 0);
-	index_buffer  = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof(cl_uint) * indices.size(), indices.begin()._Ptr, 0);
-	cell_buffer   = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof(CellData) * cells.size(), cells.begin()._Ptr, 0);
-	
+	pixel_buffer  = clCreateBuffer(context(), CL_MEM_READ_WRITE, g_Width*g_Height*sizeof(cl_float4), 0, 0);
+	random_buffer = clCreateBuffer(context(), CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, g_Width*g_Height*sizeof(cl_int), random_array, 0);
+    scene_buffer  = clCreateBuffer(context(), CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof(Triangle) * triangles.size(), triangles.data(), 0);
+	index_buffer  = clCreateBuffer(context(), CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof(cl_uint) * indices.size(), indices.data(), 0);
+	cell_buffer   = clCreateBuffer(context(), CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof(CellData) * cells.size(), cells.data(), 0);
+
 	clSetKernelArg(kernel, 0, sizeof(cl_mem), &pixel_buffer);
 	clSetKernelArg(kernel, 1, sizeof(cl_mem), &random_buffer);
 	clSetKernelArg(kernel, 2, sizeof(cl_uint), &g_Width);
@@ -95,6 +121,8 @@ void InitCL()
 	clSetKernelArg(kernel, 8, sizeof(cl_mem), &index_buffer);
 	clSetKernelArg(kernel, 9, sizeof(cl_mem), &cell_buffer);
 
+    std::cout << __FUNCTION__ << " : SUCCESS" << std::endl;
+    return true;
 }
 
 void Update(GLFWwindow *window)
@@ -187,7 +215,7 @@ int main()
 		// temp..
 		glfwSetCursorPos(window, g_Width / 2, g_Height / 2);
 		Render();
-		
+
         glfwSwapBuffers(window);
         glfwPollEvents();
     }
